@@ -2,6 +2,7 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 from openai import OpenAI
 import os
+import time
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -11,6 +12,9 @@ CORS(app)  # Permitir peticiones desde cualquier origen
 
 # Configurar OpenAI
 client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
+
+# ID del GPT personalizado (Assistant)
+ASSISTANT_ID = os.getenv('ASSISTANT_ID')
 
 # Datos del inventario
 INVENTARIO = {
@@ -37,45 +41,6 @@ HORARIOS = {
     'domingo': {'disponibles': [], 'ocupados': ['Cerrado']}
 }
 
-# System prompt para el GPT personalizado
-SYSTEM_PROMPT = """Eres un asesor especialista en autos Toyota en Perú. Tu trabajo es asesorar y recomendar buenos usos en cuanto al mantenimiento y uso de los vehículos marca Toyota.
-
-IMPORTANTE:
-- Debes ofrecer opciones que empujen la venta de artículos y el mantenimiento y servicios de taller constantes
-- Sé específico y puntual en las respuestas
-- Contesta brevemente y de acuerdo a la consulta
-- Siempre menciona productos o servicios cuando sea relevante
-- Usa precios en soles peruanos (S/)
-- Mantén un tono profesional pero amigable
-
-Información de contexto que puedes usar:
-
-INVENTARIO DISPONIBLE:
-- Filtros de aceite: S/ 35.00
-- Filtros de aire: S/ 42.00
-- Pastillas de freno: S/ 180.00
-- Discos de freno: S/ 320.00
-- Bujías: S/ 25.00
-- Aceite sintético 5W-30: S/ 165.00
-- Correas de distribución: S/ 280.00
-- Batería 12V: S/ 450.00
-- Líquido de frenos DOT4: S/ 38.00
-- Refrigerante Toyota: S/ 52.00
-
-SERVICIOS DEL TALLER:
-- Mantenimiento preventivo cada 5,000 km o 6 meses
-- Cambio de aceite + filtro: S/ 205 (incluye instalación)
-- Revisión de frenos: S/ 50
-- Limpieza de inyectores: S/ 150
-- Servicio de aire acondicionado: S/ 180
-- Rotación + balanceo de llantas: S/ 80
-- Alineación: S/ 100
-
-HORARIOS: Lunes a viernes 8:00-17:00, Sábados 8:00-12:00, Cerrado domingos
-
-TELÉFONO: (01) 555-8888
-"""
-
 @app.route('/health', methods=['GET'])
 def health():
     """Health check endpoint"""
@@ -93,7 +58,7 @@ def get_horarios():
 
 @app.route('/api/chat', methods=['POST'])
 def chat():
-    """Endpoint principal del chatbot con GPT"""
+    """Endpoint principal del chatbot con GPT Assistant personalizado"""
     try:
         data = request.get_json()
         
@@ -102,12 +67,18 @@ def chat():
         
         user_message = data['message']
         
+        # Verificar que ASSISTANT_ID esté configurado
+        if not ASSISTANT_ID:
+            return jsonify({
+                'error': 'ASSISTANT_ID no está configurado. Por favor, configura tu ID de asistente en las variables de entorno.'
+            }), 500
+        
         # Verificar si la consulta es sobre inventario o horarios
-        # Si es así, responder directamente sin usar GPT para ahorrar tokens
+        # Si es así, responder directamente sin usar el Assistant para ahorrar tokens
         msg_lower = user_message.lower()
         
         # Verificar si pregunta por inventario completo
-        if any(word in msg_lower for word in ['inventario completo', 'todos los repuestos', 'qué repuestos', 'lista de repuestos']):
+        if any(word in msg_lower for word in ['inventario completo', 'todos los repuestos', 'lista de repuestos']):
             response_text = "📦 **INVENTARIO COMPLETO**\n\n"
             for item, data in INVENTARIO.items():
                 response_text += f"**{item.upper()}**\n"
@@ -129,19 +100,52 @@ def chat():
             response_text += "📞 Reservas: (01) 555-8888"
             return jsonify({'response': response_text}), 200
         
-        # Para otras consultas, usar GPT personalizado
+        # Para otras consultas, usar el Assistant personalizado
         try:
-            completion = client.chat.completions.create(
-                model="gpt-4o-mini",  # Usar gpt-4o-mini para ser más económico
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": user_message}
-                ],
-                temperature=0.7,
-                max_tokens=500
+            # Crear un Thread (conversación)
+            thread = client.beta.threads.create()
+            
+            # Agregar el mensaje del usuario al Thread
+            client.beta.threads.messages.create(
+                thread_id=thread.id,
+                role="user",
+                content=user_message
             )
             
-            response_text = completion.choices[0].message.content
+            # Ejecutar el Assistant
+            run = client.beta.threads.runs.create(
+                thread_id=thread.id,
+                assistant_id=ASSISTANT_ID
+            )
+            
+            # Esperar a que el Assistant termine de procesar
+            max_attempts = 30  # 30 segundos máximo
+            attempt = 0
+            while attempt < max_attempts:
+                run_status = client.beta.threads.runs.retrieve(
+                    thread_id=thread.id,
+                    run_id=run.id
+                )
+                
+                if run_status.status == 'completed':
+                    break
+                elif run_status.status in ['failed', 'cancelled', 'expired']:
+                    return jsonify({
+                        'error': f'El asistente no pudo procesar la solicitud: {run_status.status}'
+                    }), 500
+                
+                time.sleep(1)
+                attempt += 1
+            
+            if attempt >= max_attempts:
+                return jsonify({'error': 'Tiempo de espera agotado'}), 500
+            
+            # Obtener la respuesta del Assistant
+            messages = client.beta.threads.messages.list(thread_id=thread.id)
+            
+            # La respuesta más reciente es la del Assistant
+            assistant_message = messages.data[0]
+            response_text = assistant_message.content[0].text.value
             
             return jsonify({'response': response_text}), 200
             
